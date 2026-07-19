@@ -774,28 +774,82 @@ async def rank(request: Request):
     return {"ranking": scored[:3]}
 
 # ================= Q9: /solve =================
-@app.post("/solve")
-async def solve(request: Request):
-    body = await request.json()
-    problem = body.get("problem", "")
-    prompt = (
+def _solve_prompt(problem, variant=1):
+    base = (
         "Solve this arithmetic word problem CAREFULLY. It deliberately contains "
-        "DISTRACTOR numbers that are irrelevant to the final answer.\n"
+        "DISTRACTOR numbers/details that are irrelevant to the final answer — "
+        "identify and ignore them.\n"
         "Work in steps:\n"
-        "1. List which numbers are relevant and which are distractors.\n"
-        "2. Do the arithmetic one operation at a time.\n"
-        "3. RE-CHECK the arithmetic a second time before finalising.\n"
+        "1. List every number mentioned and mark each as RELEVANT or DISTRACTOR, "
+        "with a one-phrase reason.\n"
+        "2. Using only the relevant numbers, do the arithmetic ONE operation at "
+        "a time, writing out each intermediate result.\n"
+        "3. RE-CHECK the arithmetic a second time, redoing each operation "
+        "independently, before finalising.\n"
+    )
+    if variant == 2:
+        base = (
+            "Solve this arithmetic word problem from scratch. Do NOT assume any "
+            "prior answer is correct — work it out independently and carefully. "
+            "It deliberately contains DISTRACTOR numbers/details that are "
+            "irrelevant to the final answer — identify and ignore them.\n"
+            "Work in steps:\n"
+            "1. Re-read the problem slowly. List every number and what it means "
+            "in context.\n"
+            "2. Determine the exact ORDER of operations the problem implies "
+            "(e.g. discount before or after tax; per-unit vs total; which "
+            "quantity multiplies which price) — state this order explicitly.\n"
+            "3. Compute step by step following that order, writing each "
+            "intermediate result, then re-verify by redoing the computation.\n"
+        )
+    return (
+        base +
         "Return JSON with EXACTLY two keys: 'reasoning' (a string >=80 chars "
         "showing your steps) and 'answer' (a JSON integer — not string, not "
         "float, no symbols).\n\n"
         f"PROBLEM:\n{problem}"
     )
+
+async def _solve_once(problem, variant):
+    out = parse_json(await chat([{"role": "user", "content": _solve_prompt(problem, variant)}],
+                                model="gpt-4o", max_tokens=1200))
+    ans = int(round(float(out.get("answer"))))
+    reasoning = str(out.get("reasoning", ""))
+    return ans, reasoning
+
+@app.post("/solve")
+async def solve(request: Request):
+    body = await request.json()
+    problem = body.get("problem", "")
     try:
-        # Q9 is graded on exact integer correctness -> use the strongest model.
-        out = parse_json(await chat([{"role": "user", "content": prompt}],
-                                    model="gpt-4o", max_tokens=1200))
-        ans = int(round(float(out.get("answer"))))
-        reasoning = str(out.get("reasoning", ""))
+        # Self-consistency: solve independently twice. If they agree, that's a
+        # strong signal it's right. If they disagree, run a tie-break pass that
+        # sees both attempts and is asked to find where one of them went wrong —
+        # this catches single-call arithmetic slips (wrong order of operations,
+        # applying a discount/tax at the wrong point, distractor bleed-through).
+        ans1, reasoning1 = await _solve_once(problem, 1)
+        ans2, reasoning2 = await _solve_once(problem, 2)
+
+        if ans1 == ans2:
+            reasoning = reasoning1
+            ans = ans1
+        else:
+            tie_prompt = (
+                "Two independent attempts at this word problem disagreed. "
+                "Find the mistake and give the CORRECT final answer.\n\n"
+                f"PROBLEM:\n{problem}\n\n"
+                f"ATTEMPT A got {ans1}, reasoning: {reasoning1}\n\n"
+                f"ATTEMPT B got {ans2}, reasoning: {reasoning2}\n\n"
+                "Redo the calculation carefully from scratch, one operation at a "
+                "time, explicitly noting which attempt (if either) made an error "
+                "and why. Return JSON with EXACTLY two keys: 'reasoning' (a "
+                "string >=80 chars) and 'answer' (a JSON integer)."
+            )
+            out = parse_json(await chat([{"role": "user", "content": tie_prompt}],
+                                        model="gpt-4o", max_tokens=1400))
+            ans = int(round(float(out.get("answer"))))
+            reasoning = str(out.get("reasoning", ""))
+
         if len(reasoning) < 80:
             reasoning = (reasoning + " Step-by-step arithmetic reasoning applied; "
                          "irrelevant distractor values were identified and ignored.").strip()
