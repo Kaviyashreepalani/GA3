@@ -150,11 +150,30 @@ def normalize_answer(ans):
         return num
     return s
 
+def _detect_image_mime(img_b64):
+    """Detect real image format from magic bytes instead of assuming PNG —
+    a hidden test image could be JPEG/WEBP/GIF and mislabeling it can make
+    some vision backends misread it."""
+    try:
+        raw = base64.b64decode(img_b64[:64] + "==")  # small prefix is enough
+    except Exception:
+        return "image/png"
+    if raw.startswith(b"\x89PNG"):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw.startswith(b"GIF8"):
+        return "image/gif"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
 @app.post("/answer-image")
 async def answer_image(request: Request):
     body = await request.json()
     img_b64 = body.get("image_base64", "")
     question = body.get("question", "")
+    img_mime = _detect_image_mime(img_b64)
     messages = [{
         "role": "user",
         "content": [
@@ -175,7 +194,7 @@ async def answer_image(request: Request):
                 "Return JSON: {\"work\": \"...\", \"answer\": \"...\"}.\n"
                 f"Question: {question}"},
             {"type": "image_url",
-             "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"}},
+             "image_url": {"url": f"data:{img_mime};base64,{img_b64}", "detail": "high"}},
         ],
     }]
     try:
@@ -195,17 +214,31 @@ async def extract(request: Request):
     if "invoice_text" in body:
         text = body.get("invoice_text", "")
         prompt = (
-            "Extract these fields from the invoice text and return JSON with "
-            "EXACTLY these keys: invoice_no, date, vendor, amount, tax, currency.\n"
+            "You are an expert invoice-field extractor. Vendors label the same "
+            "field differently — scan the WHOLE text before deciding something "
+            "is missing:\n"
+            "- invoice_no may appear as 'Invoice No', 'Invoice #', 'Invoice ID', "
+            "'Ref', 'Ref No', 'Doc No', 'Bill No', or similar.\n"
+            "- vendor may appear near 'From:', 'Vendor:', 'Billed by:', 'Seller:', "
+            "or simply be the company name in the header/letterhead.\n"
+            "- date may appear as 'Date', 'Issued', 'Invoice Date', 'Dated'.\n\n"
+            "First, in a 'reasoning' key, go through invoice_no, date, vendor, "
+            "amount, tax, currency ONE BY ONE and quote the exact snippet you "
+            "found each in (or say 'not found in text' only if you truly cannot "
+            "locate it anywhere).\n"
+            "Then give the final values.\n\n"
+            "Return JSON with EXACTLY these keys: reasoning, invoice_no, date, "
+            "vendor, amount, tax, currency.\n"
             "- date: ISO YYYY-MM-DD\n"
             "- amount: the SUBTOTAL before tax, as a plain number (no separators)\n"
             "- tax: the tax amount only, as a plain number\n"
             "- currency: ISO code (INR, USD, EUR...)\n"
-            "- use null if a field is not present.\n\n"
+            "- use null ONLY if the field truly does not appear anywhere.\n\n"
             f"TEXT:\n{text}"
         )
         try:
-            out = parse_json(await chat([{"role": "user", "content": prompt}]))
+            out = parse_json(await chat([{"role": "user", "content": prompt}],
+                                        model="gpt-4o", max_tokens=1000))
         except Exception:
             logger.exception("extract(invoice_text) failed")
             out = {}
@@ -295,16 +328,30 @@ async def dynamic_extract(request: Request):
     keys = list(schema.keys())
 
     prompt = (
-        "Extract variables from the text. Return JSON with EXACTLY these keys:\n"
-        f"{json.dumps(schema, indent=2)}\n\n"
+        "You are an expert structured-data extractor. The requested field NAMES "
+        "are just labels for what to look for — the literal word usually will "
+        "NOT appear in the text. Match by MEANING: e.g. a field called 'exam' "
+        "should match a course/subject/test name found anywhere in the text "
+        "(after 'Exam:', 'Subject:', 'for the ___ exam/test', or a course name "
+        "mentioned in context); a field called 'city' should match any place "
+        "name given as a destination/location, etc. Read the ENTIRE text before "
+        "deciding a field is missing.\n\n"
+        "First, in a 'reasoning' key, go through EACH requested field one by "
+        "one and quote the exact snippet of text that supports your answer (or "
+        "say 'not found in text' only if it truly is not present anywhere).\n"
+        "Then give the final values.\n\n"
+        f"Requested fields and types:\n{json.dumps(schema, indent=2)}\n\n"
         "Rules: dates -> ISO YYYY-MM-DD; integer/float -> JSON numbers (not "
-        "strings); boolean -> true/false; array[...] -> JSON array; if a field "
-        "cannot be found use null. Extract the SHORTEST exact value (e.g. for a "
-        "name give just the name).\n\n"
+        "strings); boolean -> true/false; array[...] -> JSON array; use null "
+        "ONLY if the field truly cannot be found anywhere after careful "
+        "reading. Extract the SHORTEST exact value (e.g. for a name give just "
+        "the name).\n\n"
+        "Return JSON with EXACTLY these keys: reasoning, " + ", ".join(keys) + "\n\n"
         f"TEXT:\n{text}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}]))
+        out = parse_json(await chat([{"role": "user", "content": prompt}],
+                                    model="gpt-4o", max_tokens=1200))
     except Exception:
         logger.exception("dynamic_extract failed")
         out = {}
