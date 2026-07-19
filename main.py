@@ -1,10 +1,22 @@
-import json, re, base64, hashlib
+import json, re, base64, hashlib, logging
 from statistics import mean, median, pstdev, pvariance, mode
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import httpx
 import config
+
+# ---------------------------------------------------------------------
+# Logging: this is the main fix. Previously every "except Exception"
+# block below swallowed the real error and just returned null/"" with
+# a 200 OK, which is why the grader saw wrong answers but your Render
+# logs showed nothing but 200s. Now the real exception (auth failure,
+# quota exceeded, bad JSON, etc.) gets printed to stdout so it shows
+# up in your Render "Logs" tab.
+# ---------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ga3")
+
 app = FastAPI()
 # CORS wide open — grader calls from a Cloudflare Worker
 app.add_middleware(
@@ -33,12 +45,18 @@ async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4)
                              headers=HEAD, json=body)
             if r.status_code in (429, 500, 502, 503, 504):
                 last_err = f"HTTP {r.status_code}: {r.text[:160]}"
+                logger.warning("chat retryable error (attempt %s): %s", attempt, last_err)
                 await asyncio.sleep(1.5 * (attempt + 1))   # backoff and retry
                 continue
+            if r.status_code in (401, 403):
+                # Auth failure — token missing/invalid/expired. Don't waste retries.
+                logger.error("AIPIPE_TOKEN auth failure: HTTP %s: %s", r.status_code, r.text[:300])
+                raise RuntimeError(f"AUTH_FAILED HTTP {r.status_code}: {r.text[:300]}")
             r.raise_for_status()
             out = r.json()["choices"][0]["message"]["content"]
             _CACHE[key] = out
             return out
+    logger.error("chat failed after %s retries: %s", retries, last_err)
     raise RuntimeError(f"chat failed after {retries} retries: {last_err}")
 # Gemini models to try in order for audio transcription. If one is overloaded (503)
 # or rate-limited (429), we retry it, then fall through to the next.
@@ -86,6 +104,32 @@ def parse_json(s):
 @app.get("/")
 async def root():
     return {"ok": True, "email": config.EMAIL}
+
+# ---------------------------------------------------------------------
+# NEW: quick health check. Open this URL in a browser right after
+# deploying: https://<your-url>/diag
+# It tells you immediately whether the token is a placeholder and
+# whether a real AIPipe call succeeds — no more guessing from 200 OK
+# responses that secretly contain nulls.
+# ---------------------------------------------------------------------
+@app.get("/diag")
+async def diag():
+    result = {
+        "email": config.EMAIL,
+        "token_looks_placeholder": ("PASTE_YOUR" in config.AIPIPE_TOKEN
+                                     or "REPLACE_WITH" in config.AIPIPE_TOKEN
+                                     or not config.AIPIPE_TOKEN.strip()),
+    }
+    try:
+        out = await chat([{"role": "user", "content": 'Reply with exactly this JSON: {"status":"ok"}'}],
+                          max_tokens=20)
+        result["chat_ok"] = True
+        result["chat_reply"] = out
+    except Exception as e:
+        result["chat_ok"] = False
+        result["chat_error"] = str(e)
+    return result
+
 # ================= Q2: /answer-image =================
 def normalize_answer(ans):
     """Clean a vision answer so it matches the grader's expected string.
@@ -139,6 +183,7 @@ async def answer_image(request: Request):
         out = parse_json(await chat(messages, model=config.VISION_MODEL, max_tokens=1200))
         ans = normalize_answer(out.get("answer", ""))
     except Exception as e:
+        logger.exception("answer_image failed")
         ans = ""
     return {"answer": str(ans)}
 # ================= Q3 + Q7: /extract =================
@@ -162,6 +207,7 @@ async def extract(request: Request):
         try:
             out = parse_json(await chat([{"role": "user", "content": prompt}]))
         except Exception:
+            logger.exception("extract(invoice_text) failed")
             out = {}
         keys = ["invoice_no", "date", "vendor", "amount", "tax", "currency"]
         return {k: out.get(k) for k in keys}
@@ -197,6 +243,7 @@ async def extract(request: Request):
         out = parse_json(await chat([{"role": "user", "content": prompt}],
                                     model="gpt-4o", max_tokens=1200))
     except Exception:
+        logger.exception("extract(schema) failed")
         out = {}
 
     # --- deterministic post-processing to match the grader exactly ---
@@ -259,6 +306,7 @@ async def dynamic_extract(request: Request):
     try:
         out = parse_json(await chat([{"role": "user", "content": prompt}]))
     except Exception:
+        logger.exception("dynamic_extract failed")
         out = {}
     # enforce exact key set AND correct types
     return {k: coerce(out.get(k, None), schema[k]) for k in keys}
@@ -344,6 +392,7 @@ async def answer_audio(request: Request):
             audio_b64 = base64.b64encode(last_audio_bytes).decode() if last_audio_bytes else ""
     except Exception as e:
         last_debug_info["parse_error"] = str(e)
+        logger.exception("answer_audio: request parse failed")
 
     last_debug_info["body_id"] = audio_id
     last_debug_info["audio_b64_len"] = len(audio_b64)
@@ -387,6 +436,7 @@ async def answer_audio(request: Request):
     except Exception as e:
         transcript = ""
         last_debug_info["exception"] = str(e)
+        logger.exception("answer_audio: transcription failed")
 
     last_debug_info["transcript"] = transcript
 
@@ -458,7 +508,7 @@ async def answer_audio(request: Request):
         num_rows = ext.get("num_rows")
         explicit_stats = ext.get("explicit_stats", {})
     except Exception:
-        pass
+        logger.exception("answer_audio: stats extraction failed")
 
     # Deterministic safety net for allowed_values (categorical 'one-of' sets). The
     # model frequently drops these entirely (empty explicit_stats/requested_stats),
@@ -704,5 +754,6 @@ async def solve(request: Request):
                          "irrelevant distractor values were identified and ignored.").strip()
         return {"reasoning": reasoning, "answer": ans}
     except Exception as e:
+        logger.exception("solve failed")
         return {"reasoning": "Could not solve reliably: " + str(e)[:120].ljust(80),
                 "answer": 0}
